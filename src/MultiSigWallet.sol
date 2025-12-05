@@ -89,6 +89,15 @@ contract MultiSigWallet is AbstractMultiSigWallet {
         if (!sOwners[msg.sender]) revert MultiSigWallet__NotOwner();
     }
 
+    modifier onlyConfirmer(address _addr) {
+        _onlyConfirmer(_addr);
+        _;
+    }
+
+    function _onlyConfirmer(address _addr) internal view {
+        if (!sOwners[_addr]) revert MultiSigWallet__NotOwner();
+    }
+
     modifier onlyValidTrnx(uint256 _txId) {
         _onlyValidTrnx(_txId);
         _;
@@ -124,7 +133,10 @@ contract MultiSigWallet is AbstractMultiSigWallet {
         sTotalTrnxs++;
     }
 
-    function confirmTrnx(uint256 _txId) public onlyOwner onlyValidTrnx(_txId) {
+    function confirmTrnx(
+        uint256 _txId,
+        address _confirmerAddr
+    ) external onlyConfirmer(_confirmerAddr) onlyValidTrnx(_txId) {
         if (sTrnxHistory[_txId].isExecuted)
             revert MultiSigWallet__TransactionAlreadyExecuted();
         if (sIsTrnxConfirmed[_txId][msg.sender])
@@ -135,7 +147,7 @@ contract MultiSigWallet is AbstractMultiSigWallet {
     function revokeTrnxConfirmation(
         uint256 _txId,
         address _confirmerAddr
-    ) public onlyOwner onlyValidTrnx(_txId) {
+    ) external onlyConfirmer(_confirmerAddr) onlyValidTrnx(_txId) {
         WalletTransaction storage trnx = sTrnxHistory[_txId];
 
         if (sIsTrnxConfirmed[_txId][_confirmerAddr]) {
@@ -147,7 +159,10 @@ contract MultiSigWallet is AbstractMultiSigWallet {
         emit TransactionConfirmation(_txId, _confirmerAddr);
     }
 
-    function _confirmTrnx(uint256 _txId, address _confirmerAddr) private {
+    function _confirmTrnx(
+        uint256 _txId,
+        address _confirmerAddr
+    ) private onlyOwner onlyValidTrnx(_txId) {
         WalletTransaction storage trnx = sTrnxHistory[_txId];
         sIsTrnxConfirmed[_txId][_confirmerAddr] = true;
         sTrnxConfirmedTime[_txId][_confirmerAddr] = block.timestamp;
@@ -166,13 +181,16 @@ contract MultiSigWallet is AbstractMultiSigWallet {
         if (address(this).balance <= trnx.amount)
             revert MultiSigWallet__InsufficientBallance();
 
+        trnx.isExecuted = true;
         (bool success, ) = payable(trnx.destinationAddr).call{
             value: trnx.amount
         }("");
 
-        if (!success) revert MultiSigWallet__TransactionFailed();
+        if (!success) {
+            trnx.isExecuted = false;
+            revert MultiSigWallet__TransactionFailed();
+        }
 
-        trnx.isExecuted = true;
         emit TransactionExecuted(
             _txId,
             trnx.initiatingAddr,
