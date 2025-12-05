@@ -5,10 +5,13 @@ abstract contract AbstractMultiSigWallet {
     // errors
     error MultiSigWallet__EmptyApprovers();
     error MultiSigWallet__ZeroConfirmers();
-    error MultiSigWallet__NotOwner();
+    error MultiSigWallet__InvalidThreshold();
+    error MultiSigWallet__InvalidOwner();
+    error MultiSigWallet__OwnerNotUnique();
     error MultiSigWallet__InsufficientBallance();
+    error MultiSigWallet__NotOwner();
     error MultiSigWallet__InvalidTransaction();
-    error MmultiSigWaller_TransactionFailed();
+    error MultiSigWallet__TransactionFailed();
     error MultiSigWallet__TransactionAlreadyExecuted();
     error MultiSigWallet__TransactionAlreadyConfirmed();
     error MultiSigWallet__TransactionPendingConfirmation();
@@ -45,9 +48,9 @@ contract MultiSigWallet is AbstractMultiSigWallet {
 
     // State variables
     uint256 private immutable I_NO_OF_CONFIRMATIONS;
-
-    address[] private sOwners;
     uint256 private sTotalTrnxs;
+
+    mapping(address => bool) private sOwners;
     mapping(uint256 trnxId => WalletTransaction transaction)
         private sTrnxHistory;
     mapping(uint256 trnxId => mapping(address => uint256))
@@ -56,17 +59,20 @@ contract MultiSigWallet is AbstractMultiSigWallet {
         private sIsTrnxConfirmed;
 
     constructor(address[] memory _owners, uint256 _noOfConfirmations) {
-        if (_owners.length == 0) {
-            revert MultiSigWallet__EmptyApprovers();
-        }
-
-        if (_noOfConfirmations == 0) {
-            revert MultiSigWallet__ZeroConfirmers();
-        }
+        if (_owners.length == 0) revert MultiSigWallet__EmptyApprovers();
+        if (_noOfConfirmations > _owners.length)
+            revert MultiSigWallet__InvalidThreshold();
+        if (_noOfConfirmations == 0) revert MultiSigWallet__ZeroConfirmers();
 
         for (uint256 i = 0; i < _owners.length; i++) {
-            sOwners.push(_owners[i]);
+            address owner = _owners[i];
+            if (owner == address(0)) revert MultiSigWallet__InvalidOwner();
+            if (_addrExistsInOwners(owner))
+                revert MultiSigWallet__OwnerNotUnique();
+
+            sOwners[owner] = true;
         }
+
         I_NO_OF_CONFIRMATIONS = _noOfConfirmations;
     }
 
@@ -75,30 +81,34 @@ contract MultiSigWallet is AbstractMultiSigWallet {
     }
 
     modifier onlyOwner() {
-        _isOwner();
+        _onlyOwner();
         _;
     }
 
-    function _isOwner() internal view {
-        bool flag = false;
-        for (uint256 i = 0; i < sOwners.length; i++) {
-            if (msg.sender == sOwners[i]) {
-                flag = true;
-                break;
-            }
-        }
-        if (!flag) {
-            revert MultiSigWallet__NotOwner();
-        }
+    function _onlyOwner() internal view {
+        if (!sOwners[msg.sender]) revert MultiSigWallet__NotOwner();
+    }
+
+    modifier onlyValidTrnx(uint256 _txId) {
+        _onlyValidTrnx(_txId);
+        _;
+    }
+
+    function _onlyValidTrnx(uint256 _txId) internal view {
+        if (!(_txId < sTotalTrnxs)) revert MultiSigWallet__InvalidTransaction();
+    }
+
+    function _addrExistsInOwners(address _addr) internal view returns (bool) {
+        if (sOwners[_addr]) return true;
+        return false;
     }
 
     function initiateTransaction(
         address _destinationAddress,
         uint256 _amount
     ) public onlyOwner {
-        if (address(this).balance <= _amount) {
+        if (address(this).balance <= _amount)
             revert MultiSigWallet__InsufficientBallance();
-        }
 
         uint256 trnxId = sTotalTrnxs;
         sTrnxHistory[trnxId] = WalletTransaction({
@@ -114,53 +124,57 @@ contract MultiSigWallet is AbstractMultiSigWallet {
         sTotalTrnxs++;
     }
 
-    function confirmTrnx(uint256 _trnxId) internal onlyOwner {
-        if (!(_trnxId < sTotalTrnxs)) {
-            revert MultiSigWallet__InvalidTransaction();
-        }
-        if (sTrnxHistory[_trnxId].isExecuted) {
+    function confirmTrnx(uint256 _txId) public onlyOwner onlyValidTrnx(_txId) {
+        if (sTrnxHistory[_txId].isExecuted)
             revert MultiSigWallet__TransactionAlreadyExecuted();
-        }
-        if (sIsTrnxConfirmed[_trnxId][msg.sender]) {
+        if (sIsTrnxConfirmed[_txId][msg.sender])
             revert MultiSigWallet__TransactionAlreadyConfirmed();
-        }
-        _confirmTrnx(_trnxId, msg.sender);
+        _confirmTrnx(_txId, msg.sender);
     }
 
-    function _confirmTrnx(uint256 _trnxId, address _confirmerAddr) private {
-        WalletTransaction storage trnx = sTrnxHistory[_trnxId];
-        sIsTrnxConfirmed[_trnxId][_confirmerAddr] = true;
-        sTrnxConfirmedTime[_trnxId][_confirmerAddr] = block.timestamp;
+    function revokeTrnxConfirmation(
+        uint256 _txId,
+        address _confirmerAddr
+    ) public onlyOwner onlyValidTrnx(_txId) {
+        WalletTransaction storage trnx = sTrnxHistory[_txId];
+
+        if (sIsTrnxConfirmed[_txId][_confirmerAddr]) {
+            trnx.totalConfirmers--;
+        }
+        sIsTrnxConfirmed[_txId][_confirmerAddr] = false;
+        sTrnxConfirmedTime[_txId][_confirmerAddr] = block.timestamp;
+
+        emit TransactionConfirmation(_txId, _confirmerAddr);
+    }
+
+    function _confirmTrnx(uint256 _txId, address _confirmerAddr) private {
+        WalletTransaction storage trnx = sTrnxHistory[_txId];
+        sIsTrnxConfirmed[_txId][_confirmerAddr] = true;
+        sTrnxConfirmedTime[_txId][_confirmerAddr] = block.timestamp;
         trnx.totalConfirmers++;
 
-        emit TransactionConfirmation(_trnxId, _confirmerAddr);
+        emit TransactionConfirmation(_txId, _confirmerAddr);
 
-        if (trnx.totalConfirmers >= I_NO_OF_CONFIRMATIONS) {
-            _executeTrnx(_trnxId);
-        }
+        if (trnx.totalConfirmers >= I_NO_OF_CONFIRMATIONS) _executeTrnx(_txId);
     }
 
-    function _executeTrnx(uint256 _trnxId) private {
-        WalletTransaction storage trnx = sTrnxHistory[_trnxId];
+    function _executeTrnx(uint256 _txId) private {
+        WalletTransaction storage trnx = sTrnxHistory[_txId];
 
-        if (trnx.totalConfirmers < I_NO_OF_CONFIRMATIONS) {
+        if (trnx.totalConfirmers < I_NO_OF_CONFIRMATIONS)
             revert MultiSigWallet__TransactionPendingConfirmation();
-        }
-        if (address(this).balance <= trnx.amount) {
+        if (address(this).balance <= trnx.amount)
             revert MultiSigWallet__InsufficientBallance();
-        }
 
         (bool success, ) = payable(trnx.destinationAddr).call{
             value: trnx.amount
         }("");
 
-        if (!success) {
-            revert MmultiSigWaller_TransactionFailed();
-        }
+        if (!success) revert MultiSigWallet__TransactionFailed();
 
         trnx.isExecuted = true;
         emit TransactionExecuted(
-            _trnxId,
+            _txId,
             trnx.initiatingAddr,
             trnx.destinationAddr
         );
@@ -172,5 +186,11 @@ contract MultiSigWallet is AbstractMultiSigWallet {
 
     function getTotalTrnxs() external view returns (uint256) {
         return sTotalTrnxs + 1;
+    }
+
+    function getTrnx(
+        uint256 _txId
+    ) external view onlyValidTrnx(_txId) returns (WalletTransaction memory) {
+        return sTrnxHistory[_txId];
     }
 }
